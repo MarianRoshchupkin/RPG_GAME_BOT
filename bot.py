@@ -3,6 +3,7 @@ import os
 import uuid
 import urllib3
 import requests
+import click
 
 from datetime import datetime
 from dotenv import load_dotenv
@@ -293,37 +294,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Проверяем, находимся ли в процессе квеста
     if context.user_data.get("in_quest"):
         # Обрабатываем текст для квеста
-        quest_progress = context.user_data.get("quest_progress")
-        if quest_progress:
-            db = SessionLocal()
-            try:
-                # Мержим объект, чтобы он был привязан к текущей сессии
-                quest_progress = db.merge(quest_progress)  # Это привяжет объект к сессии
-                db.commit()  # Коммитим изменения, если необходимо
-
-                # Теперь можно безопасно обновить объект
-                db.refresh(quest_progress)
-
-                # Получаем текущую информацию о квесте
-                quest_id = quest_progress.quest_id
-                current_stage = quest_progress.current_stage
-
-                # Пошлём запрос к GigaChat с текстом от игрока
-                system_role = "Ты — ведущий RPG-квеста. На каждом этапе реагируй на действие игрока."
-                user_prompt = f"Игрок продолжает квест: {user_text}"
-
-                # Получаем ответ от GigaChat для текущего этапа
-                response = giga_chat_api.generate_game_step(system_role, user_prompt)
-
-                # Обновляем прогресс
-                quest_progress.current_stage += 1
-                context.user_data["quest_progress"] = quest_progress
-
-                # Отправляем новый ответ
-                await update.message.reply_text(response)
-                return
-            finally:
-                db.close()
+        await handle_quest_dialog(update, context)
+        return
 
     # Если не в процессе создания персонажа и не в квесте
     await update.message.reply_text(
@@ -532,30 +504,31 @@ async def handle_quest_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE
     """
     Когда пользователь пишет любой текст после начала квеста, мы предполагаем,
     что это "ответ" на текущем этапе. Получаем прогресс, отправляем сообщение в GigaChat,
-    получаем реакцию.
+    получаем реакцию от модели и двигаемся дальше.
     """
+    # Сначала берём "сырой" объект пользователя (он у нас отсоединён от сессии)
     user_obj = get_or_create_rpg_user(update)
     if not user_obj:
-        return
+        return  # на всякий случай выходим
 
     db = SessionLocal()
     try:
-        # Ищем активный квест (где is_completed=False, current_stage между 1 и 5)
+        # Ищем активный квест (где is_completed=False и этап < 6)
         progress = db.query(QuestProgress).filter(
             QuestProgress.user_id == user_obj.id,
             QuestProgress.is_completed == False,
-            QuestProgress.current_stage < 6  # всего 5 этапов
+            QuestProgress.current_stage < 6
         ).first()
 
+        # Нет активного квеста — ничего не делаем
         if not progress:
-            # Если нет активного квеста, пропускаем
             return
 
         quest = db.query(Quest).filter(Quest.id == progress.quest_id).first()
         if not quest:
             return
 
-        # Это следующий ход игрока
+        # Сообщение пользователя
         player_message = update.message.text
 
         # Формируем prompt для GigaChat
@@ -575,33 +548,40 @@ async def handle_quest_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         reply_from_giga = giga_chat_api.generate_game_step(system_role, user_prompt)
 
-        # Увеличиваем stage
+        # Переходим на следующий этап
         progress.current_stage += 1
 
-        # Если дошли до 5 этапа, проверяем, "успешно" или "провал"
-        if progress.current_stage > 5:
-            # Допустим, считаем, что квест всегда выполнен (для упрощения),
-            # или вы можете искать в ответе фразы "успех"/"неудача".
+        # Проверяем, дошли ли до финала
+        if progress.current_stage >= 5:
+            # Квест завершается
             progress.is_completed = True
 
-            # Начисляем награду
-            user_obj.experience += quest.reward_exp
-            # Проверяем, не хватает ли очков для поднятия уровня (например, 100xp = 1 lvl)
-            while user_obj.experience >= 100:
-                user_obj.experience -= 100
-                user_obj.level += 1
+            # Получаем «живого» пользователя из БД в текущей сессии:
+            db_user = db.query(RPGUser).filter(RPGUser.id == user_obj.id).one()
+            db_user.experience += quest.reward_exp
+
+            # Проверяем, не пора ли поднять уровень (если опыта >= 100, например)
+            while db_user.experience >= 100:
+                db_user.experience -= 100
+                db_user.level += 1
 
             db.commit()
 
+            # Сообщаем игроку о награде и новом уровне
             await update.message.reply_text(
                 f"{reply_from_giga}\n\n"
                 "Это был финальный этап квеста! "
                 f"Вы получили {quest.reward_exp} опыта.\n"
-                f"Ваш уровень теперь: {user_obj.level}, опыт: {user_obj.experience}."
+                f"Ваш уровень теперь: {db_user.level}, опыт: {db_user.experience}."
             )
+
+            # Снимаем флаг «в квесте»
+            context.user_data["in_quest"] = False
+            context.user_data["quest_progress"] = None
+
         else:
+            # Просто сохраняем состояние и даём GigaChat-ответ
             db.commit()
-            # Выводим ответ от GigaChat
             await update.message.reply_text(reply_from_giga)
 
     except Exception as e:
