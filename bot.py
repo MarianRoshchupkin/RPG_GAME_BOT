@@ -235,78 +235,97 @@ async def create_character(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Пошагово спрашиваем имя, потом класс:
     await update.message.reply_text("Введите имя вашего персонажа:")
-    # Используем ConversationHandler или храним состояние через context.user_data
     context.user_data["creating_character"] = True
     context.user_data["step"] = 1
 
 
+# ---------------------
+#   Обработчики команд
+# ---------------------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Универсальная функция, которая обрабатывает текст, когда не распознана команда.
-    Если пользователь находится в процессе создания персонажа, здесь ловим шаги.
+    Если пользователь находится в процессе создания персонажа или в процессе квеста, здесь ловим шаги.
     """
     user_text = update.message.text
     user_obj = get_or_create_rpg_user(update)
     if not user_obj:
         return
 
-    # Проверяем, находимся ли в режиме "создания персонажа"
+    # Проверяем, находимся ли в процессе создания персонажа
     if context.user_data.get("creating_character"):
         step = context.user_data.get("step", 1)
 
         if step == 1:
-            # Пользователь ввёл имя
-            # Открываем новую сессию, чтобы обновить пользователя
+            user_obj.character_name = user_text
+            context.user_data["step"] = 2
             db = SessionLocal()
             try:
-                # Получаем "свежего" пользователя для обновления (по Telegram ID)
-                user_in_db = db.query(RPGUser).filter(RPGUser.telegram_id == user_obj.telegram_id).first()
-                if user_in_db:
-                    user_in_db.character_name = user_text
-                    db.commit()
-                    db.expunge(user_in_db)  # Отвязываем от сессии
+                db.add(user_obj)
+                db.commit()
             finally:
                 db.close()
-
-            context.user_data["step"] = 2
-            await update.message.reply_text(
-                "Отлично! Теперь введите класс вашего персонажа (Мечник, Маг или Лучник):"
-            )
+            await update.message.reply_text("Отлично! Теперь введите класс вашего персонажа (Мечник, Маг или Лучник):")
             return
 
         elif step == 2:
-            # Пользователь ввёл класс
+            user_obj.character_class = user_text.capitalize()
             db = SessionLocal()
             try:
-                user_in_db = db.query(RPGUser).filter(RPGUser.telegram_id == user_obj.telegram_id).first()
-                if user_in_db:
-                    user_in_db.character_class = user_text.capitalize()  # Например, "Маг"
-                    db.commit()
-                    db.expunge(user_in_db)
+                db.add(user_obj)
+                db.commit()
             finally:
                 db.close()
 
             context.user_data["creating_character"] = False
             context.user_data["step"] = 0
 
-            # Чтобы отобразить актуальные данные, снова получим свежие поля
             refreshed_user = get_or_create_rpg_user(update)
-            if refreshed_user:
-                await update.message.reply_text(
-                    f"Персонаж создан!\n"
-                    f"Имя: {refreshed_user.character_name}\n"
-                    f"Класс: {refreshed_user.character_class}\n"
-                    f"Уровень: {refreshed_user.level}, Опыт: {refreshed_user.experience}",
-                    reply_markup=main_menu_keyboard()
-                )
-            else:
-                await update.message.reply_text(
-                    "Ошибка при обновлении персонажа.",
-                    reply_markup=main_menu_keyboard()
-                )
+            await update.message.reply_text(
+                f"Персонаж создан!\n"
+                f"Имя: {refreshed_user.character_name}\n"
+                f"Класс: {refreshed_user.character_class}\n"
+                f"Уровень: {refreshed_user.level}, Опыт: {refreshed_user.experience}",
+                reply_markup=main_menu_keyboard()
+            )
             return
 
-    # Если не в режиме создания персонажа — отвечаем универсальным сообщением
+    # Проверяем, находимся ли в процессе квеста
+    if context.user_data.get("in_quest"):
+        # Обрабатываем текст для квеста
+        quest_progress = context.user_data.get("quest_progress")
+        if quest_progress:
+            db = SessionLocal()
+            try:
+                # Мержим объект, чтобы он был привязан к текущей сессии
+                quest_progress = db.merge(quest_progress)  # Это привяжет объект к сессии
+                db.commit()  # Коммитим изменения, если необходимо
+
+                # Теперь можно безопасно обновить объект
+                db.refresh(quest_progress)
+
+                # Получаем текущую информацию о квесте
+                quest_id = quest_progress.quest_id
+                current_stage = quest_progress.current_stage
+
+                # Пошлём запрос к GigaChat с текстом от игрока
+                system_role = "Ты — ведущий RPG-квеста. На каждом этапе реагируй на действие игрока."
+                user_prompt = f"Игрок продолжает квест: {user_text}"
+
+                # Получаем ответ от GigaChat для текущего этапа
+                response = giga_chat_api.generate_game_step(system_role, user_prompt)
+
+                # Обновляем прогресс
+                quest_progress.current_stage += 1
+                context.user_data["quest_progress"] = quest_progress
+
+                # Отправляем новый ответ
+                await update.message.reply_text(response)
+                return
+            finally:
+                db.close()
+
+    # Если не в процессе создания персонажа и не в квесте
     await update.message.reply_text(
         "Неизвестная команда или сообщение. Введите /help, чтобы увидеть список команд."
     )
@@ -332,7 +351,6 @@ async def show_character(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Опыт: {user_obj.experience}\n"
     )
     await update.message.reply_text(text, reply_markup=main_menu_keyboard())
-
 
 # ---------------------
 #  Квесты
@@ -474,30 +492,22 @@ async def quest_start_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             db.add(progress)
             db.commit()
 
-        # Формируем сообщение для GigaChat: system_role + user_message
-        system_role = (
-            "Ты — ведущий RPG-квеста. На основе заданного лора и роли персонажа "
-            "веди диалог с пользователем. Квест должен иметь 5 этапов, "
-            "после чего проверяй, достигнут ли финальный результат."
-        )
-        user_prompt = (
-            f"Игрок начинает квест: {quest.title}\n"
-            f"Описание: {quest.description}\n"
-            f"Цель: {quest.final_result}\n"
-            f"Класс игрока: {user_obj.character_class}.\n"
-            f"Это первый этап, опиши, что происходит и спроси, что игрок будет делать."
-        )
+        # Формируем сообщение для GigaChat
+        system_role = "Ты — ведущий RPG-квеста. ..."
+        user_prompt = "Игрок начинает квест..."
 
         reply_from_giga = giga_chat_api.generate_game_step(system_role, user_prompt)
 
-        # Обновляем этап (переходим на stage 1)
+        # Обновляем этап
         progress.current_stage = 1
         db.commit()
 
+        # Активируем флаг квеста
+        context.user_data["in_quest"] = True
+        context.user_data["quest_progress"] = progress
+
         await query.edit_message_text(
-            f"Квест '{quest.title}' начат!\n"
-            "--------------------------\n"
-            f"{reply_from_giga}"
+            f"Квест '{quest.title}' начат!\n{reply_from_giga}"
         )
     except Exception as e:
         logger.error(f"Ошибка при старте квеста: {e}")
@@ -620,20 +630,7 @@ def main():
     application.add_handler(CallbackQueryHandler(quest_start_callback, pattern="^quest_start_"))
     application.add_handler(CallbackQueryHandler(quest_cancel_callback, pattern="^quest_cancel"))
 
-    # Ещё один обработчик для диалогов в квесте (если захотите разделять).
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_quest_dialog
-        )
-    )
-    # Текстовые сообщения (для создания персонажа и для диалогов квеста)
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_text  # Создание персонажа
-        )
-    )
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     application.run_polling()
 

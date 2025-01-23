@@ -3,7 +3,7 @@ import sys
 import subprocess
 from dotenv import load_dotenv
 
-from models import init_db, Base, engine
+from models import init_db, populate_quests, Base, engine
 
 load_dotenv()
 
@@ -19,6 +19,7 @@ def initdb():
     click.echo("Инициализация базы данных...")
     try:
         init_db()
+        populate_quests()
         click.echo("Таблицы успешно созданы!")
     except Exception as e:
         click.echo(f"Ошибка при создании таблиц: {e}")
@@ -50,6 +51,7 @@ def resetdb():
             Base.metadata.drop_all(engine)
             click.echo("Таблицы удалены.")
             init_db()
+            populate_quests()
             click.echo("База данных создана заново.")
         except Exception as e:
             click.echo(f"Ошибка сброса БД: {e}")
